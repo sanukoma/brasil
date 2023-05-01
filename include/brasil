@@ -1,0 +1,2109 @@
+## +-------------------------------------------------------------------------+
+## | @(#) BRASIL - Bash Refurbished Applications Selecting Imperfect Library |
+## +-------------------------------------------------------------------------+
+##
+## NAME
+##   brasil
+##
+## DESCRIPTION
+##   This file includes the core public functions of the brasil shell scripting library.
+##   It helps to solve some every day shell scripting problems by implementing functions 
+##   for simple logging, signal handling, file locking, concurrency and load control,
+##   debugging capabilities, limiting maximum execution time, etc.
+##
+## AUTHOR
+##   Olaf Maaß
+##   Send all enhancements and bug reports to Olaf Maaß <olaf.maass@sanuk.de> (sanukoma)
+##
+## LICENSE
+##   MIT License
+##
+##   Copyright (c) 2023 sanukoma
+##
+##   Permission is hereby granted, free of charge, to any person obtaining a copy
+##   of this software and associated documentation files (the "Software"), to deal
+##   in the Software without restriction, including without limitation the rights
+##   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+##   copies of the Software, and to permit persons to whom the Software is
+##   furnished to do so, subject to the following conditions:
+##
+##   The above copyright notice and this permission notice shall be included in all
+##   copies or substantial portions of the Software.
+##
+##   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+##   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+##   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+##   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+##   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+##   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE 
+##   SOFTWARE.
+##
+
+: ${BIL_INITIALIZED:=}
+
+[ ${BIL_INITIALIZED} ] && return
+
+## Don't disturb during initialization
+## -----------------------------------
+trap "" HUP INT QUIT TERM USR1 USR2 ALRM ERR EXIT
+
+BIL_INCLUDE_SCRIPT_RUNNING=brasil
+
+## check mandatory commands
+## ------------------------
+command -v bash >/dev/null      || { echo "ERROR: MANDATORY COMMAND \"bash\" NOT FOUND!" >&2; return 8; }
+command -v awk >/dev/null       || { echo "ERROR: MANDATORY COMMAND \"awk\" NOT FOUND!" >&2; return 8; }
+command -v sed >/dev/null       || { echo "ERROR: MANDATORY COMMAND \"sed\" NOT FOUND!" >&2; return 8; }
+command -v grep >/dev/null      || { echo "ERROR: MANDATORY COMMAND \"grep\" NOT FOUND!" >&2; return 8; }
+command -v readlink >/dev/null  || { echo "ERROR: MANDATORY COMMAND \"readlink\" NOT FOUND!" >&2; return 8; }
+command -v printf >/dev/null    || { echo "ERROR: MANDATORY COMMAND \"printf\" NOT FOUND!" >&2; return 8; }
+command -v timeout >/dev/null   || { echo "ERROR: MANDATORY COMMAND \"timeout\" NOT FOUND!" >&2; return 8; }
+command -v shasum >/dev/null    || { echo "ERROR: MANDATORY COMMAND \"shasum\" NOT FOUND!" >&2; return 8; }
+command -v md5sum >/dev/null    || { echo "ERROR: MANDATORY COMMAND \"md5sum\" NOT FOUND!" >&2; return 8; }
+command -v find >/dev/null      || { echo "ERROR: MANDATORY COMMAND \"find\" NOT FOUND!" >&2; return 8; }
+
+declare -xA BIL_MSG_SEVERITY=( [debug3]=6 [debug2]=5 [debug]=4 [info]=3 [notice]=2 [warning]=2 [syntax]=1 [err]=1 [error]=1 [crit]=1 [alert]=1 [emerg]=0 [none]=0 )
+declare -xA BIL_MSG_COLOR=( [debug3]="LBLUE" [debug2]="LBLUE" [debug]="LBLUE" [info]="GREEN" [notice]="LGREEN" [warning]="LYELLOW" [syntax]="LRED" [err]="LRED" [error]="LRED" [crit]="LGRAY+BGRED" [alert]="LYELLOW+BGRED" [emerg]="LGRAY+BGMAGENTA" )
+declare -xA BIL_MSG_STDERR=( [debug3]=1 [debug2]=1 [debug]=1 [info]=1 [notice]=1 [warning]=1 [syntax]=0 [err]=0 [error]=0 [crit]=0 [alert]=0 [emerg]=0 )
+declare -xA BIL_MSG_LOGPREFIX=( [debug3]="DEBUG3  " [debug2]="DEBUG2  " [debug]="DEBUG   " [info]="INFO    " [notice]="NOTICE  " [warning]="WARNING " [syntax]="SYNTAX  " [err]="ERROR   " [error]="ERROR   " [crit]="CRITICAL" [alert]="ALERT   " [emerg]="EMERG   ")
+declare -xA BIL_MSG_ULOGPREFIX=( [debug3]="DEBUG3  " [debug2]="DEBUG2  " [debug]="DEBUG   " [info]="INFO    " [notice]="NOTICE  " [warning]="WARNING " [syntax]="SYNTAX  " [err]="ERROR   " [error]="ERROR   " [crit]="CRITICAL" [alert]="ALERT   " [emerg]="EMERG   ")
+declare -xA BIL_MSG_PRTPREFIX=( [debug3]="DEBUG3  " [debug2]="DEBUG2  " [debug]="DEBUG   " [info]="INFO    " [notice]="NOTICE  " [warning]="WARNING " [syntax]="SYNTAX  " [err]="ERROR   " [error]="ERROR   " [crit]="CRITICAL" [alert]="ALERT   " [emerg]="EMERG   ")
+declare -xA BIL_LIST_OF_TMPFILES=()
+declare -xA BIL_LIST_OF_TMPDIRS=()
+
+## ==============================================================================
+##                               BRASIL FUNCTIONS
+## ==============================================================================
+
+function _BIL:cpuLoad {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  cat <(grep 'cpu ' /proc/stat) <(sleep 1 && grep 'cpu ' /proc/stat) | awk -v RS="" '{printf "%.2f\n", ($13-$2+$15-$4)*100/($13-$2+$15-$4+$16-$5)}'
+
+}
+
+function _BIL:random {
+
+  local min=${1:-1}
+  local max=${2:-99}
+
+  awk -v min=$min -v max=$max -v seed="$(od -An -N4 -tu4 /dev/urandom)" 'BEGIN{srand(seed+0); print int(min+rand()*(max-min+1))}'
+
+}
+
+
+## ------------------------------------------------------------------------------
+## function: _BIL:highlightError
+##
+## description: internal function to display a line in error and some lines before
+##   and after that line. This function will automatically be called by the err trap.
+##   The color of the output lines can be controled by BIL_HIGHLIGHT_ERROR_COLOR variable.
+##
+## usage: _BIL:highlight_error <sourcefile> <errorline#>
+##
+
+function _BIL:highlightError {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local sourcefile=${BIL_TRAP_SOURCE}
+  local errorline=${BIL_TRAP_LINENO}
+  local linenums
+  local -i lines=0
+  local -i i=0 lastline=0 firstline=0
+  local BS=" \010"
+
+  [ -e $sourcefile ] || { BIL:msg error "sourcefile FILE \"$sourcefile\" NOT FOUND"; return; }
+  [ -s $sourcefile ] || { BIL:msg error "sourcefile FILE \"$sourcefile\" IS EMPTY"; return; }
+
+  lines=$(awk 'END { print NR }' $sourcefile)
+
+  (( lines < 1000000 )) && linenums=6
+  (( lines < 100000  )) && linenums=5
+
+  (( errorline > lines)) && errorline=$lines
+
+  lastline=$(( errorline - 4 ))
+  [ $lastline -lt 1 ] && lastline=1
+
+  firstline=$(( errorline + 4 ))
+  [ $firstline -gt $lines ] && firstline=$lines
+
+  { printf "    ";BIL:cout "${BIL_HIGHLIGHT_ERROR_COLOR[0]}" "SOURCE: $sourcefile:\n"
+
+    (( lastline < errorline )) && for (( i=lastline; i<errorline; i++ )); do
+      printf "    %0${linenums}d " ${i}; BIL:cout "${BIL_HIGHLIGHT_ERROR_COLOR[1]}" "${BS}$(sed -n ${i}p ${sourcefile})\n"
+    done
+
+    BIL:cout "${BIL_HIGHLIGHT_ERROR_COLOR[2]}" "    "$(printf "%0${linenums}d" ${errorline})
+    BIL:cout "${BIL_HIGHLIGHT_ERROR_COLOR[2]}" "*"
+    BIL:cout "${BIL_HIGHLIGHT_ERROR_COLOR[2]}" "${BS}$(sed -n ${errorline}p ${sourcefile})\n"
+
+    (( errorline+1 <= firstline )) && for (( i=errorline+1; i<=firstline-1; i++ )); do
+      printf "    %0${linenums}d " ${i};  BIL:cout "${BIL_HIGHLIGHT_ERROR_COLOR[1]}" "${BS}$(sed -n ${i}p ${sourcefile})\n"
+    done
+  } | BIL:msg error
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:checkProcessHealth
+##
+## description: internal function to check if a BRASIL process is still RUNNING
+##
+## usage: BIL:checkProcessHealth <processId>
+##
+## returns: 
+##   true:  if <processId> is running
+##   false: if <processId> is dead
+##
+
+function BIL:checkProcessHealth {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local pid=${1:-}
+
+  if [[ ${pid} =~ ^[0-9]+$ ]]; then 
+
+    # if LIFELOG is not already created, simulate life signs
+    if { cat ${BIL_LIFELOG} 2>/dev/null || echo "${pid} $(date +%s)"; } | awk '
+        BEGIN { RC=1 }
+        /^'"${pid}"'/
+        {
+         if (('"$(date +%s)"'-$2) < '"${BIL_LIFELOG_DEATHTIME}"' )
+           RC=0
+         else
+           RC=1
+        }
+        END { exit RC }' >/dev/null 2>&1 
+    then
+      if [ -d /proc/${pid} ]; then
+        true
+      else
+        false
+      fi
+    else
+      false
+    fi
+
+  fi
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:dumpVars
+##
+## description: display brasil global variables (prefixed by "BIL_")
+##
+## usage: BIL:dumpVars [<filter>]
+##
+
+function BIL:dumpVars {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local varname=""
+  local filter=${@:-BIL_}
+  local varline=$(eval echo \${!BIL_@}|tr ' ' '\n'|grep $filter|tr '\n' ' ')
+
+  for varname in "${varline}"; do
+    printf "%s\n" "$(declare -p $varname)"
+  done
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:dumpFunctions
+##
+## description: display brasil global functions
+##
+## usage: BIL:dumpFunctions
+##
+
+function BIL:dumpFunctions {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  ## TERM=dump supresses grep auto coloring
+  ( TERM=dumb declare -F | cut -d " " -f3- |grep "^BIL:" )
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:setTrap
+##
+## description: If traps are allowed (BIL_TRAP_LOCKED = false) than enable
+## trap handling for the signals:
+##    HUP
+##    INT
+##    QUIT
+##    TERM
+##    USR1
+##    USR2
+##    ALRM
+##
+## by use of the general signal handler function "BIL:signalHandler",
+## otherwise disable trap handling.
+##
+## usage: BIL:setTrap
+##
+
+function BIL:setTrap {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  if [ "${BIL_TRAP_LOCKED: -1}" = "${BIL_TRUE}" ]; then
+    trap "" HUP
+    trap "" INT
+    trap "" QUIT
+    trap "" TERM
+    trap "" USR1
+    trap "" USR2
+    trap "" ALRM
+    trap "" ERR
+    trap "" EXIT
+  else
+    trap 'rc=$?; BIL:signalHandler SIGHUP     ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' HUP
+    trap 'rc=$?; BIL:signalHandler SIGINT     ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' INT
+    trap 'rc=$?; BIL:signalHandler SIGQUIT    ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' QUIT
+    trap 'rc=$?; BIL:signalHandler SIGTERM    ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' TERM
+    trap 'rc=$?; BIL:signalHandler SIGUSR1    ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' USR1
+    trap 'rc=$?; BIL:signalHandler SIGUSR2    ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' USR2
+    trap 'rc=$?; BIL:signalHandler SIGALRM    ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' ALRM
+#   trap 'rc=$?; BIL:signalHandler SIGERR     ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' ERR
+#   trap 'rc=$?; BIL:signalHandler SIGEXIT    ${LINENO} ${FUNCNAME[0]} $(caller|cut -d " " -f2) $rc' EXIT
+  fi
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:lockTrap
+##
+## description: Disable the possibility of interupting program execution via
+## different signals. This functionaltity should be used in critical sections,
+## that shouldn't be interupted.
+##
+## usage: BIL:lockTrap
+##
+
+function BIL:lockTrap {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  BIL_TRAP_LOCKED=${BIL_TRAP_LOCKED}${BIL_TRUE}
+
+  BIL:setTrap
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:unlockTrap
+##
+## description: Enable the possibility of interupting program execution via
+## different signals.(Not yet implemented: Stored signals are catched up by calling the
+## BIL:signalHandler function)
+##
+## usage: BIL:unlockTrap
+##
+
+function BIL:unlockTrap {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  BIL_TRAP_LOCKED=${BIL_TRAP_LOCKED%?}
+
+  BIL:setTrap
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:setMaxcc
+##
+## description: Setting the maximum condition code to the given parm
+## if it is greater than the actual value of the BIL_MAXCC variable.
+##
+## usage: BIL:setMaxcc <condition code>
+##
+
+function BIL:setMaxcc {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local rc=$1
+
+  [ $rc -gt $BIL_MAXCC ] && BIL_MAXCC=$rc
+
+  return
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:die
+##
+## description: Terminate the currently executing script in a controlled manner.
+##
+## usage: BIL:die <exitcode> [<message>]
+##
+
+function BIL:die {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  BIL:lockTrap
+
+  local -i exitCode=${1:-1}
+  local lines
+  local message
+
+  [ $# -ne 0 ] && shift
+
+  message="$@"
+
+  ## only die once...
+  ## ----------------
+  [ "${BIL_EXIT_VIA_DIE}" = "${BIL_TRUE}" ] && exit ${exitCode}
+  BIL_EXIT_VIA_DIE=${BIL_TRUE}
+
+  BIL:setMaxcc ${exitCode}
+
+  local level
+  case ${BIL_MAXCC} in
+    0)                                               level=notice;;
+    `[ ${BIL_MAXCC} -le 4 ]   && echo ${BIL_MAXCC}`) level=warning;;
+    `[ ${BIL_MAXCC} -le 8 ]   && echo ${BIL_MAXCC}`) level=error;;
+    `[ ${BIL_MAXCC} -le 16 ]  && echo ${BIL_MAXCC}`) level=alert;;
+    `[ ${BIL_MAXCC} -le 255 ] && echo ${BIL_MAXCC}`) level=error;;
+    *)                                               level=info;;
+  esac
+
+  [ "$message"x != ""x ] && BIL:msg $level "$message"
+
+  [ "${BIL_NO_CLEANUP}"x != "${BIL_TRUE}"x ] && BIL:cleanup || :
+
+  ## remove lockqueues
+  ## -----------------
+  if [ ${#BIL_LIST_OF_LOCKQUEUES[@]} -ne 0 ]; then
+    for curentry in ${BIL_LIST_OF_LOCKQUEUES[@]}; do
+      [ "${curentry}" = "${BIL_APPL_NAME}" ] && continue
+      BIL:releaseQueue $curentry >/dev/null 2>&1 || :
+    done
+  fi
+
+  [ "${BIL_NO_TEMPDIR_DELETE}"x = "${BIL_TRUE}"x ] && : || { rmdir $(dirname ${BIL_TMPPREFIX}) 2>/dev/null || true; }
+
+  ## terminate heartbeat
+  ## -------------------
+  BIL:lockFile ${BIL_LIFELOG}
+
+    if [ -n "${BIL_HEARTBEAT_PID}" ]; then
+      if [ -d /proc/${BIL_HEARTBEAT_PID} ]; then
+        kill -9 ${BIL_HEARTBEAT_PID} 2>/dev/null
+        wait ${BIL_HEARTBEAT_PID} 2>/dev/null
+        BIL:msg debug2 "heartbeat-${BIL_APPL_NAME}-${BIL_PROCID} ENDED - PID=${BIL_HEARTBEAT_PID}"
+      else
+        BIL:msg error "heartbeat-${BIL_APPL_NAME}-${BIL_PROCID} ENDED ABNORMALLY - PID=${BIL_HEARTBEAT_PID}"
+      fi
+    fi
+
+    sed -i "/^${BIL_PROCID}/d" ${BIL_LIFELOG} 2>/dev/null
+
+    lines=$(wc -l ${BIL_LIFELOG} 2>/dev/null|cut -d ' ' -f1)
+    lines=${lines:-0}
+    if [ ${lines} -eq 0 ]; then
+      rm ${BIL_LIFELOG} 2>/dev/null
+
+      # cleanup orphant temp files
+      [ -n "${BIL_TMPPREFIX}" ] && find ${BIL_TMPPREFIX}\#* -delete 2>/dev/null || :
+    fi
+
+  BIL:unlockFile ${BIL_LIFELOG}
+
+  kill $(jobs -p) 2>/dev/null || :
+
+  cd ${BIL_ORIGINAL_DIR}
+
+  BIL:releaseQueue ${BIL_APPL_NAME} 2>/dev/null || :
+
+  BIL:cleanupQueue ${BIL_APPL_NAME} 2>/dev/null || :
+
+  BIL:msg $level "${BIL_APPL_CMD} ${BIL_APPL_VERSION:+v${BIL_APPL_VERSION}} ENDED - MAXRC=${BIL_MAXCC}"
+
+  [ -f ${BIL_MSG_BUFFER} ] && rm ${BIL_MSG_BUFFER} 2>/dev/null || :
+
+  exit ${BIL_MAXCC}
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:cleanup
+##
+## description: restoring umask, tty settings, deleting tempfiles, etc.
+##
+## usage: BIL:cleanup
+##
+
+function BIL:cleanup {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local curentry
+
+  # restore original umask
+  if [ "${BIL_ORIGINAL_UMASK:-}"x != ""x ]; then
+    umask ${BIL_ORIGINAL_UMASK}
+  fi
+
+  # reset stty settings
+  if [ "${BIL_STTY_SETTINGS:-}"x != ""x ]; then
+    stty ${BIL_STTY_SETTINGS} >/dev/null 2>&1
+  fi
+
+  # execute defined exit routines
+  if [ "${BIL_EXIT_ROUTINES:-}"x != ""x ]; then
+    local exitroutine
+    BIL:msg debug2 "EXECUTING the EXIT ROUTINE(S) \"${BIL_EXIT_ROUTINES/BIL:done/} BIL:done\""
+
+    for exitroutine in ${BIL_EXIT_ROUTINES/BIL:done/} BIL:done; do
+      type ${exitroutine} >/dev/null
+      if [ $? -ne 0 ]; then
+        BIL:msg info "EXIT routine \"${exitroutine}\" is NOT DEFINED"
+      else
+        BIL:msg debug "CALLING the EXIT ROUTINE \"${exitroutine}\" NOW"
+        ( ${exitroutine} )
+      fi
+    done
+    BIL_EXIT_ROUTINES=""
+  fi
+
+  # remove temporary files
+  if [ "${BIL_NO_TEMPFILES_DELETE}"x != "${BIL_TRUE}"x ]; then
+    if [ ${#BIL_LIST_OF_TMPFILES[@]} -ne 0 ]; then
+      BIL:msg debug "REMOVING TEMPORARY FILES - BIL_LIST_OF_TMPFILES=\"${!BIL_LIST_OF_TMPFILES[@]}\""
+
+      for curentry in ${!BIL_LIST_OF_TMPFILES[@]}; do
+        BIL:removeTemp $curentry || :
+      done
+    fi
+  else
+    BIL:msg debug2 "BIL_NO_TEMPFILES_DELETE is SET - SKIPPING REMOVING TEMPORARY FILES"
+  fi
+
+  # remove temporary directories
+  if [ "${BIL_NO_TEMPDIR_DELETE}"x != "${BIL_TRUE}"x ]; then
+    if [ ${#BIL_LIST_OF_TMPDIRS[@]} -ne 0 ]; then
+      BIL:msg debug "REMOVING TEMPORARY DIRECTORIES - BIL_LIST_OF_TMPDIRS=\"${!BIL_LIST_OF_TMPDIRS[@]}\""
+
+      for curentry in ${!BIL_LIST_OF_TMPDIRS[@]}; do
+        BIL:removeTemp $curentry || :
+      done
+    fi
+  else
+    BIL:msg debug2 "BIL_NO_TEMPDIR_DELETE is SET - SKIPPING REMOVING TEMPORARY DIRECTORIES"
+  fi
+
+  return 0
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:signalHandler
+##
+## description: general trap handler
+##
+## usage: automatically by signal
+##
+##     parameters: $1: signal name / number
+##                 $2: line number
+##                 $3: function name
+##                 $4: source of signal
+##                 $5: return code
+##
+## returns: -
+##
+
+function BIL:signalHandler {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  BIL:lockTrap
+
+  local rc
+  local myrc=0
+  local default_action_ok=${BIL_TRUE}
+  local user_defined_function
+
+
+  BIL_TRAP_SIGNAL=$1
+  BIL_TRAP_LINENO=$2
+  BIL_TRAP_FUNCTION=$3
+  BIL_TRAP_SOURCE=$4
+  rc=$5
+
+  [ "${BIL_SIGNAL_HANDLER_RUNNING}"x = "${BIL_TRUE}"x ] && exit 1
+
+  BIL_SIGNAL_HANDLER_RUNNING=${BIL_TRUE}
+
+  eval user_defined_function="\$BIL_SIGNAL_${BIL_TRAP_SIGNAL}_FUNCTION"
+
+  if [[ "${BIL_EXIT_VIA_DIE}"x != "${BIL_TRUE}"x && ${BIL_TRAP_SIGNAL} != "exit" ]]; then
+    if eval [[ ! "\${BIL_SIGNAL_HANDLE_${BIL_TRAP_SIGNAL}}" = "${BIL_FALSE}" ]]; then
+      BIL:msg debug2 "TRAP SIGNAL \"${BIL_TRAP_SIGNAL}\" RECEIVED - FUNCTION: ${BIL_TRAP_FUNCTION[@]}, SOURCE: ${BIL_TRAP_SOURCE}, LINE: ${BIL_TRAP_LINENO}"
+      BIL:msg debug "TRAP \"${BIL_TRAP_SIGNAL}\" CAUGHT"
+      [ "${BIL_INCLUDE_SCRIPT_RUNNING}"x != ""x ] && BIL:msg debug "Trap occured inside of the include script \"${BIL_INCLUDE_SCRIPT_RUNNING}\""
+    else
+      BIL:msg debug2 "TRAP SIGNAL \"${BIL_TRAP_SIGNAL}\" RECEIVED - FUNCTION: ${BIL_TRAP_FUNCTION[@]}, SOURCE: ${BIL_TRAP_SOURCE}, LINE: ${BIL_TRAP_LINENO}"
+      BIL:msg debug "TRAP SIGNAL \"${BIL_TRAP_SIGNAL}\" CAUGHT BUT IGNORED"
+      BIL_SIGNAL_HANDLER_RUNNING=${BIL_FALSE}
+      BIL:unlockTrap
+      return
+    fi
+  fi
+
+  if [ "${user_defined_function}"x = ""x ]; then
+    BIL:msg debug "NO USER DEFINED FUNCTION for SIGNAL \"${BIL_TRAP_SIGNAL}\" DECLARED"
+  else
+    typeset +f |grep "^${user_defined_function}" >/dev/null
+
+    if [ $? -ne 0 ]; then
+      BIL:msg info "FUNCTION \"${user_defined_function}\" is DECLARED but NOT DEFINED"
+    else
+      BIL:msg debug2 "EXECUTING the USER DEFINED FUNCTION \"${user_defined_function}\" for SIGNAL \"${BIL_TRAP_SIGNAL}\""
+      ${user_defined_function}
+      myrc=$?
+      BIL:msg debug2 "USER DEFINED FUNCTION ENDED - RC=${myrc}"
+
+      if [ ${myrc} -ne 0 ]; then
+        BIL:msg info "DEFAULT ACTION for this signal WILL NOT BE EXECUTED"
+        default_action_ok=${BIL_FALSE}
+      fi
+    fi
+  fi
+
+  if [ ${default_action_ok} -eq ${BIL_TRUE} ]; then
+    case ${BIL_TRAP_SIGNAL} in
+      1| "SIGHUP")          BIL_SIGNAL_HANDLER_RUNNING=${BIL_FALSE}
+                            BIL:unlockTrap
+                            ;;
+      2|"SIGINT")           if [ ${BIL_USER_BREAK_ALLOWED} -eq ${BIL_TRUE} ]; then
+                              BIL:die 249 "SCRIPT ABORTED by the user via SIGNAL BREAK (CTRL-C)"
+                            else
+                              BIL:msg debug2 "BREAK SIGNAL (CTRL-C) RECEIVED BUT IGNORED"
+                            fi
+                            ;;
+      3| "SIGQUIT")         BIL:die 250 "QUIT signal RECEIVED";;
+      15|"SIGTERM")         BIL:die 251 "SCRIPT ABORTED by the external SIGNAL TERM";;
+      "SIGUSR1")            :
+                            ;;
+      "SIGUSR2")            :
+                            ;;
+      "SIGERR")             set +o errexit
+                            BIL:msg error "A COMMAND ENDED WITH an ERROR - RC=${rc}"
+                            BIL:die 252
+                            ;;
+      0|"exit"|"EXIT")      if [ "${BIL_EXIT_VIA_DIE}"x != "${BIL_TRUE}"x ]; then
+                              BIL:msg err "EXIT signal RECEIVED - RC=${rc}"
+                              [ "${BIL_INCLUDE_SCRIPT_RUNNING}"x != ""x ] && BIL:msg debug "EXIT OCCURED INSIDE of the INCLUDE SCRIPT \"${BIL_INCLUDE_SCRIPT_RUNNING}\""
+
+                              if [ "${BIL_CLEANUP_ON_ERROR}"x = "${BIL_TRUE}"x ]; then
+                                BIL:msg debug "BIL_CLEANUP_ON_ERROR SET - IMPLICITLY CALLING function \"BIL:die\""
+                                BIL:die 253 "FUNCTION \"BIL:die\" should be explicitly used TO END PROGRAM"
+                              else
+                                BIL:msg warning "USE FUNCTION  \"BIL:die\" to END PROGRAM"
+                              fi
+                            fi
+                            ;;
+      "SIGALRM")            BIL:die 254 "MAXIMUM EXECUTION TIME (${BIL_TIME}s) EXCEEDED - TERMINATING NOW!"
+    			    ;;
+      *)                    BIL:die 255 "UNKNOWN SIGNAL CAUGHT: ${BIL_TRAP_SIGNAL}"
+    			    ;;
+    esac
+  fi
+
+  return
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:createTemp
+##
+## description: create a temporary file/fifo/directory
+##
+## usage: BIL:createTemp [ <mode> | --file ] <name>
+##
+## mode:
+##         --file       create a temporary file (default)
+##         --fifo       create a temporary fifo
+##         --directory  create a temporary directory
+##
+## returns:    0: OK
+##          <> 0: NOT OK
+##
+
+function BIL:createTemp {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local mode
+  local uniqid=$(uuidgen)
+  local name=""
+  local tempfile
+  local -i myrc=0
+  local original_umask=$(umask)
+
+  case $# in
+    1) name=$1
+       mode='--file';;
+    2) mode=$1
+       name=$2;;
+    *) BIL:msg error "$0: INVALID NUMBER OF PARAMETERS SPECIFIED"
+       return 8;;
+  esac
+
+  [[ -v "BIL_LIST_OF_TMPFILES[$name]" || -v "BIL_LIST_OF_TMPDIRS[$name]" ]] && { BIL:msg error "$0: NAME \"${name}\" ALREADY IN USE" ;return 8; }
+
+  [[ "${mode,,}" == "--file" || "${mode,,}" == "--fifo" || "${mode,,}" == "--directory" ]] || BIL:msg error "FUNCTION BIL:createTemp - INVALID MODE PARAMETER <$mode> SPECIFIED"
+
+  ## Absolute or relative name
+  [[ "${name:0:1}" == "/" ]] && tempfile=${name} || tempfile="${BIL_TMPPREFIX}#${BIL_PROCID}_${name}"
+
+  BIL:lockTrap  ## BEGIN OF "CRITICAL" SECTION
+
+  if [[ "${mode,,}" == "--file" ]]; then
+    [ -n "${BIL_TMPFILE_UMASK}" ] && umask ${BIL_TMPFILE_UMASK}
+    ( : > ${tempfile} ) 2>/dev/null
+    [ -a ${tempfile} ]
+  elif [[ "${mode,,}" == "--fifo" ]]; then
+    [ -n "${BIL_TMPFILE_UMASK}" ] && umask ${BIL_TMPFILE_UMASK}
+    mknod ${tempfile} p 2>/dev/null
+    [ -e ${tempfile} ]
+  elif [[ "${mode,,}" == "--directory" ]]; then
+    [ -n "${BIL_TMPDIR_UMASK}" ] && umask ${BIL_TMPDIR_UMASK}
+    mkdir ${tempfile} 2>/dev/null
+    [ -d ${tempfile} ]
+  fi
+  myrc=$?
+
+  set +o nounset
+  if [ ${myrc} -eq 0 ]; then
+    if [[ "${mode,,}" == "--fifo" || "${mode,,}" == "--file" ]]; then
+      eval BIL_LIST_OF_TMPFILES[$name]=${tempfile}
+    fi
+
+    if [ "${mode,,}" = "--directory" ]; then
+      eval BIL_LIST_OF_TMPDIRS[$name]=${tempfile}
+    fi
+
+    set -o nounset
+
+    BIL:msg debug2 "CREATED \"$name\" TEMPORARY $(x=${mode#--}; echo ${x^^})"
+
+  else
+    BIL:msg err "CREATING \"$name\" TEMPORARY $(x=${mode#--}; echo ${x^^}) FAILED"
+  fi
+
+  BIL:unlockTrap  ## END OF "CRITICAL" SECTION
+
+  umask "${original_umask}"
+
+  return $myrc
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:removeTemp
+##
+## description: remove a temporary file/fifo/directory
+##
+## usage: BIL:removeTemp <name>
+##
+## returns:    0: OK
+##             1: NOT OK
+##
+
+function BIL:removeTemp {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local name=$1
+  local tempfile
+  local -i myrc=0
+  local filetype
+
+  [ -z "${name}" ] && return
+
+  set +o nounset
+  tempfile=${BIL_LIST_OF_TMPFILES[$name]}
+
+  if [ -p "$tempfile" ]; then
+    filetype=FIFO
+  elif [ -f "$tempfile" ]; then
+    filetype=FILE
+  elif [ -d "${BIL_LIST_OF_TMPDIRS[$name]}" ]; then
+    tempfile=${BIL_LIST_OF_TMPDIRS[$name]}
+    filetype=DIRECTORY
+  fi
+
+  filetype=${filetype:-FILE}
+
+  if [ "$filetype" = "FILE" -o "$filetype" = "FIFO" ]; then
+
+    if [[ -f $tempfile || -p $tempfile ]]; then
+      rm $tempfile 2>/dev/null || myrc=$?
+
+      if [ ${myrc} -eq 0 ]; then
+        unset "BIL_LIST_OF_TMPFILES[${name}]"
+        BIL:msg debug2 "DELETED \"${name}\" TEMPORARY ${filetype} - DSN=${tempfile}"
+      else
+        BIL:msg debug2 "DELETING \"${name}\" TEMPORARY ${filetype} FAILED - DSN=${tempfile}"
+      fi
+    else
+      unset "BIL_LIST_OF_TMPFILES[${name}]"
+      myrc=0
+    fi
+  fi
+
+  if [ "$filetype" = "DIRECTORY" ]; then
+    rmdir $tempfile 2>/dev/null || myrc=$?
+
+    if [ ${myrc} -eq 0 ]; then
+      unset BIL_LIST_OF_TMPDIRS[${name}]
+      BIL:msg debug2 "DELETED \"${name}\" TEMPORARY ${filetype} - DIR=${tempfile}"
+    else
+      BIL:msg debug2 "DELETING \"${name}\" TEMPORARY ${filetype} FAILED - DIR=${tempfile}"
+    fi
+
+  fi
+
+  return $myrc
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:lockFile
+##
+## description: create a lockfile or wait until lockfile is released
+##
+## usage: BIL:lockFile <name>
+##
+## where <name> is a fully qualified file name
+##
+## returns:
+##           0 - lockfile created
+##           1 - lockdir not found
+##           2 - timeout
+##
+
+function BIL:lockFile {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local lockfile=${1}.LCK
+  local sleeptime=0.1
+  local maxcount=$((${BIL_APPL_LOCK_MAXWAIT}*10))
+  local mycounter=0
+  local pid
+  local myrc=2
+
+  [[ -d $(dirname ${lockfile}) ]] || return 1
+
+  while true
+  do
+    if [ -s ${lockfile} ]; then
+      pid=$(head -1 $lockfile 2>/dev/null)
+
+      if [[ -n "$pid" ]]; then
+
+        ## if lockfile belongs to $BIL_PROCID then break
+        ## ---------------------------------------------
+        if [ "${pid}" = "${BIL_PROCID}" ]; then
+          myrc=0
+          break
+        fi
+
+        ## if lockfile is blocked for non existant procid delete the lockfile
+        ## ------------------------------------------------------------------
+        if [[ "${pid}" =~ ^[0-9]+$ ]]; then
+          BIL:checkProcessHealth ${pid} || { rm -f ${lockfile} >/dev/null 2>&1; } || : # remove without raising an error
+        else
+          # remove lockfile if pid is not a number
+          rm -f ${lockfile} >/dev/null 2>&1
+        fi
+
+      fi
+
+    fi
+
+    BIL:lockTrap  ## BEGIN OF "CRITICAL" SECTION
+
+      # try to write $BIL_PROCID to ${lockfile}
+      set -C
+
+      if ( echo ${BIL_PROCID} > ${lockfile} ) >/dev/null 2>&1; then
+        myrc=0
+
+        set +o nounset
+        [[ " ${BIL_LIST_OF_LOCKFILES[@]} " =~ " ${lockfile} " ]] || BIL_LIST_OF_LOCKFILES+=( ${lockfile} )
+        set -o nounset
+
+        set +C
+        BIL:unlockTrap  ## END OF "CRITICAL" SECTION
+        break	# lockfile belongs to $BIL_PROCID
+      fi
+
+      set +C
+
+    BIL:unlockTrap  ## END OF "CRITICAL" SECTION
+
+    sleep ${sleeptime}
+
+    (( mycounter += 1 ))
+
+    [ ${mycounter} -ge ${maxcount} ] && break
+  done
+
+
+  return ${myrc}
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:unlockFile
+##
+## description: remove lockfile
+##
+## usage: BIL:unlockFile <name>
+##
+## where <name> is a fully qualified file name
+##
+## returns: 0 (always)
+##
+
+function BIL:unlockFile {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local lockfile=${1}.LCK
+  local pid
+
+  if [ -s ${lockfile} ]; then
+    pid=$(head -1 $lockfile 2>/dev/null)
+
+    ## if lockfile is blocked for non existant procid delete the lockfile
+    ## ------------------------------------------------------------------
+    if [[ "${pid}" =~ ^[0-9]+$ ]]; then
+      BIL:checkProcessHealth ${pid} || { rm -f ${lockfile} 2>/dev/null || : ;} # remove without raising an error
+
+      if [ "${pid}" = "${BIL_PROCID}" ]; then
+        set +o nounset
+        rm -f ${lockfile} 2>/dev/null && BIL_LIST_OF_LOCKFILES=( "${BIL_LIST_OF_LOCKFILES[@]/$lockfile}" ) || :
+        set -o nounset
+      fi
+    else
+      rm -f ${lockfile} >/dev/null 2>&1
+    fi
+  else
+    ## empty lockfiles can be deleted
+    ## ------------------------------
+    rm -f ${lockfile} 2>/dev/null || :
+  fi
+
+  return 0
+
+}
+
+
+## ------------------------------------------------------------------------------
+## function: BIL:waitforQueue
+##
+## description: put BIL_PROCID into a FIFO lockqueue and act according the given mode
+##
+##
+## usage: BIL:waitforQueue [ <mode> | --sequential ] <name>
+##
+## returns:
+##           0 - lockqueue acquired
+##           1 - error while acquiring lockqueue
+##           2 - timeout
+##
+
+function BIL:waitforQueue {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local mode
+  local name
+  local lockqueue
+  local myrc=1
+  local sleeptime=0.1
+  local maxcount=$((${BIL_APPL_QUEUE_MAXWAIT}*10))
+  local mycounter=0
+  local pid
+
+  case $# in
+    0)          BIL:die 8 "BIL:waitforQueue: REQUIRED <name> PARM NOT SPECIFIED!";;
+    1)          name=$1
+                mode="--sequential";;
+    2)          mode=${1,,}
+                name=$2;;
+    *)          BIL:die 8 "BIL:waitforQueue: TOO MANY parameters GIVEN!";;
+  esac
+
+  case $name in
+    /*) lockqueue=$name;;
+    *) lockqueue=$(echo ${BIL_TMPPREFIX}${name}_${BIL_RUNTYPE}_QUEUE | tr ':' '_' | tr '.' '_');;
+  esac
+
+  BIL:lockFile ${lockqueue} || return $?
+
+    # add ${BIL_PROCID} to FIFO lockqueue
+    grep -q "${BIL_PROCID}" ${lockqueue} 2>/dev/null || echo ${BIL_PROCID} >> ${lockqueue}
+
+    set +o nounset
+    [[ " ${BIL_LIST_OF_LOCKQUEUES[@]} " =~ " ${name} " ]] || BIL_LIST_OF_LOCKQUEUES+=( ${name} )
+    set -o nounset
+
+    ## prevent deadlock situations
+    if ! BIL:checkProcessHealth $(head -1 ${lockqueue} 2>/dev/null); then
+      BIL:cleanupQueue ${name}
+    fi
+
+  BIL:unlockFile ${lockqueue}
+
+  [ -f ${lockqueue} ] || return 1
+
+  while true; do
+    case ${mode} in
+      --sequential) if [[ "$(head -1 ${lockqueue} 2>/dev/null)" = "${BIL_PROCID}" ]]; then
+                      myrc=0
+                      break
+                    fi
+                    ;;
+      --exclusive)  if [[ "$(head -1 ${lockqueue} 2>/dev/null)" != "${BIL_PROCID}" ]]; then
+                      myrc=1
+                      break
+                    else
+                      myrc=0
+                      break
+                    fi
+                    ;;
+      --parallel)   if head -n ${BIL_PARALLEL:-99999} ${lockqueue} 2>/dev/null|grep -q ${BIL_PROCID}; then
+                      myrc=0
+                      break
+                    fi;;
+    esac
+
+    sleep ${sleeptime}
+    (( mycounter += 1 ))
+
+    # in order to prevent deadlock situations, where (for mode=sequential) the first one
+    # in the queue has died suddenly and unexpectedly
+    # ----------------------------------------------------------------------------------
+    if (( mycounter % 100 == 0 )); then
+        ## prevent deadlock situations
+        if ! BIL:checkProcessHealth $(head -1 ${lockqueue} 2>/dev/null); then
+          BIL:cleanupQueue ${name}
+        fi
+    fi
+
+    [ ${mycounter} -ge ${maxcount} ] && break
+
+  done
+
+  return ${myrc}
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:releaseQueue
+##
+## description: delete BIL_PROCID from queue
+##
+## usage: BIL:releaseQueue <name>
+##
+## returns: 0 (allways)
+##
+
+function BIL:releaseQueue {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local name=$1
+  local lockqueue
+
+  case $name in
+    /*) lockqueue=$name;;
+    *) lockqueue=$(echo ${BIL_TMPPREFIX}${name}_${BIL_RUNTYPE}_QUEUE | tr ':' '_' | tr '.' '_');;
+  esac
+
+  ## return if lockqueue doesn't exists
+  ## ---------------------------------- 
+  [ -f ${lockqueue} ] || return 0
+
+  BIL:lockFile ${lockqueue} || return 0
+
+    ## delete $BIL_PROCID from lockqueue file
+    ## --------------------------------------
+    grep -q "${BIL_PROCID}" "${lockqueue}" 2>/dev/null && sed -i "/^${BIL_PROCID}/d" "${lockqueue}" 2>/dev/null
+
+    ## delete lockqueue file if empty
+    ## ------------------------------
+    if [ -s "${lockqueue}" ]; then
+      :
+    else
+      rm ${lockqueue} 2>/dev/null || :
+      BIL_LIST_OF_LOCKQUEUES=( "${BIL_LIST_OF_LOCKQUEUES[@]/$name}" )
+    fi
+
+  BIL:unlockFile ${lockqueue}
+
+  return 0
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:cleanupQueue
+##
+## description: cleanup lockqueue from orphant pids
+##
+## usage: BIL:cleanupQueue <name>
+##
+## returns: 0 (always)
+##
+
+function BIL:cleanupQueue {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local name=$1
+  local lockqueue
+  local pid
+
+  case $name in
+    /*) lockqueue=$name;;
+    *) lockqueue=$(echo ${BIL_TMPPREFIX}${name}_${BIL_RUNTYPE}_QUEUE | tr ':' '_' | tr '.' '_');;
+  esac
+
+
+  # return if lockqueue doesn't exist
+  [ -f ${lockqueue} ] || return 0
+
+  # remove dead cleanup lockfile
+  pid=$(head -1 ${lockqueue}.CLEANUP 2>/dev/null)
+
+  if BIL:checkProcessHealth ${pid}; then
+    return
+  else
+    rm -f ${lockqueue}.CLEANUP 2>/dev/null
+  fi
+
+  [ -f ${lockqueue}.CLEANUP ] && return
+
+  BIL_APPL_LOCK_MAXWAIT=60 BIL:lockFile ${lockqueue} || return 0
+
+    # only cleanup every second
+    if [ -f ${lockqueue}.CLEANUP ]; then
+      BIL:unlockFile ${lockqueue}
+      return
+    else
+      echo ${BIL_PROCID} > ${lockqueue}.CLEANUP
+    fi
+
+    for pid in $(cat ${lockqueue} 2>/dev/null); do 
+      if BIL:checkProcessHealth ${pid}; then
+        :
+      else
+        sed -i "/^${pid}/d" ${lockqueue} 2>/dev/null || :
+      fi
+    done
+
+    # delete lockqueue if empty
+    if [ -s "${lockqueue}" ]; then
+      :
+    else
+      rm ${lockqueue} 2>/dev/null || :
+      BIL_LIST_OF_LOCKQUEUES=( "${BIL_LIST_OF_LOCKQUEUES[@]/$name}" )
+    fi
+
+    [ -f ${lockqueue}.CLEANUP ] && rm ${lockqueue}.CLEANUP 2>/dev/null
+
+  BIL:unlockFile ${lockqueue}
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:cout
+##
+## description: print a colored message to stdout without newline,
+## multiple color values have to be concatenated by a "+" sign
+##
+## usage: BIL:cout [color1[+color2[+color(n)]]] <message>
+##
+
+function BIL:cout {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local color
+  local -u col
+  local message=""
+
+  case "$#" in
+    "1")  color="$1";;
+    "2")  color="$1"
+          shift
+          message="$@";;
+    *) echo "SYNTAX ERROR in BIL:cout: NUMBER OF PARAMETERS NOT BETWEEN 1 and 2!" >&2; exit 2;;
+  esac
+
+  ## expand color names to #BIL_COL* variables
+  ## ----------------------------------------
+
+  color=$(for col in ${color//+/ }; do printf "\${BIL_COL_%s}" $col; done)
+
+  if [ -z "$message" ]; then
+    cat - | sed 's!^\(.*\)!'"$(eval echo -ne ${color})"'\1'"$(echo -ne ${BIL_COL_RESET})"'!g' #>&8
+  else
+    echo -ne "$(eval echo -ne ${color})${message}${BIL_COL_RESET}" # | awk '{ printf $0; fflush(stdout) }' >&8
+  fi
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:msg
+##
+## description: print a message (or stdin) to stdout and/or logfile
+##
+## usage: BIL:msg <serverity> <message>
+## or:    BIL:msg <message>
+## or:    stdout | BIL:msg <severity>
+## or:    stdout | BIL:msg
+##
+
+function BIL:msg {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local -l severity=""
+  local message=""
+  local timestamp=""
+  local callingFunction=${FUNCNAME[1]}
+  # local contty=$(tty | sed -e 's/.*tty\(.*\)/\1/')
+
+  BIL_LOGLEVEL=${BIL_LOGLEVEL:-none}
+  BIL_ULOGLEVEL=${BIL_ULOGLEVEL:-none}
+
+  case $# in
+  0)    severity=dummy;;
+  1)    if [ -t 0 ]; then
+          message=$1
+          severity=dummy
+        else
+          severity=$1
+        fi;;
+  2)    severity=$1
+        message=$2;;
+  *)    severity=$1;shift
+        message="$@";;
+  esac
+
+  timestamp=$(date "${BIL_MSG_DATETIME_FORMAT}")
+
+  con_msg() {
+    set +x;${BIL_FUNCTION_HEADER}
+
+    local timestamp="${1}";[ $# -gt 0 ] && shift
+    local severity="${1}"; [ $# -gt 0 ] && shift
+    local color=""
+    local message_prefix=""
+
+    [[ "${BIL_VERBOSE}" == "${BIL_FALSE}" ]] && return
+
+    [ ${BIL_MSG_SEVERITY[${BIL_PRTLEVEL:-none}]} -lt ${BIL_MSG_SEVERITY[$severity]:-0} ] && return
+
+    [ -n "${BIL_MSG_PRTPREFIX[$severity]}" -a ${BIL_MSG_SEVERITY[${BIL_PRTLEVEL:-none}]} -ge 0  ] && message_prefix="${BIL_MSG_PRTPREFIX[$severity]}"
+
+    [ "${BIL_MSG_PRTTIMESTAMP}" = "${BIL_TRUE}" ] || timestamp=""
+
+    timestamp="$timestamp${timestamp:+ }"
+
+    case ${BIL_MSG_STDERR[${severity}]} in
+      ${BIL_TRUE})  [[ X"${BIL_COLOR_STDERR}" = X"${BIL_TRUE}" && -t 2 ]] && color="${BIL_MSG_COLOR[$severity]}" || color="NONE"
+                    [ ${BIL_MSG_NEWLINE} -eq ${BIL_TRUE} ] \
+                      && awk -v prefix="$(eval echo ${BIL_MSG_FORMAT})" '{ print prefix $0 }' | BIL:cout "${color}" >&9 \
+                      || awk -v prefix="$(eval echo ${BIL_MSG_FORMAT})" '{ printf "%s%s", prefix, $0 }' | BIL:cout "${color}" >&9
+                    ;;
+      ${BIL_FALSE}) [[ X"${BIL_COLOR_STDOUT}" = X"${BIL_TRUE}" && -t 1 ]] && color="${BIL_MSG_COLOR[$severity]}" || color="NONE"
+                    [ ${BIL_MSG_NEWLINE} -eq ${BIL_TRUE} ] \
+                      && awk -v prefix="$(eval echo ${BIL_MSG_FORMAT})" '{ print prefix $0 }' | BIL:cout "${color}" >&8 \
+                      || awk -v prefix="$(eval echo ${BIL_MSG_FORMAT})" '{ printf "%s%s", prefix, $0 }' | BIL:cout "${color}" >&8
+                    ;;
+    esac
+
+  }
+
+  log_msg() {
+
+    [[ -z "${BIL_LOGCMD}" || ! -f "${BIL_LOGFILE}" ]] && return
+
+    BIL_APPL_LOCK_MAXWAIT=60 BIL:waitforQueue ${BIL_TMPPREFIX}MSG_$(echo ${BIL_LOGFILE} | md5sum | cut -f1 -d" ")_QUEUE || return
+
+    (
+    set +x;${BIL_FUNCTION_HEADER}
+
+    local timestamp="${1}"; [ $# -gt 0 ] && shift
+    local severity="${1}";  [ $# -gt 0 ] && shift
+
+
+    [[ "${BIL_MSG_SEVERITY[${BIL_LOGLEVEL:-none}]}" -lt "${BIL_MSG_SEVERITY[$severity]:-0}" ]] && return
+
+    [ -n "${BIL_MSG_LOGPREFIX[$severity]}" ] && local message_prefix="${BIL_MSG_LOGPREFIX[$severity]}"
+
+    BIL_SEVERITY=$severity
+
+    awk -v prefix="$(eval echo ${BIL_MSG_FORMAT})" '{ print prefix $0 }'
+
+    ) | sed 's,\x1B\[[0-9;]*[a-zA-Z],,g' | eval ${BIL_LOGCMD}
+
+    BIL:releaseQueue ${BIL_TMPPREFIX}MSG_$(echo ${BIL_LOGFILE} | md5sum | cut -f1 -d" ")_QUEUE
+
+  }
+
+  ulog_msg() {
+
+    [[ -z "${BIL_ULOGCMD}" || ! -f "${BIL_ULOGFILE}" ]] && return
+
+    BIL_APPL_LOCK_MAXWAIT=60 BIL:waitforQueue ${BIL_TMPPREFIX}MSG_$(echo ${BIL_ULOGFILE}| md5sum | cut -f1 -d" ")_QUEUE || return
+
+    (
+    set +x;${BIL_FUNCTION_HEADER}
+
+    local timestamp="${1}"; [ $# -gt 0 ] && shift
+    local severity="${1}";  [ $# -gt 0 ] && shift
+
+
+    [[ "${BIL_MSG_SEVERITY[${BIL_ULOGLEVEL:-none}]}" -lt "${BIL_MSG_SEVERITY[$severity]:-0}" ]] && return
+
+    [ -n "${BIL_MSG_ULOGPREFIX[$severity]}" ] && local message_prefix="${BIL_MSG_ULOGPREFIX[$severity]}"
+
+    BIL_SEVERITY=$severity
+
+    awk -v prefix="$(eval echo ${BIL_MSG_FORMAT})" '{ print prefix $0 }'
+
+    ) | sed 's,\x1B\[[0-9;]*[a-zA-Z],,g' | eval ${BIL_ULOGCMD}
+
+    BIL:releaseQueue ${BIL_TMPPREFIX}MSG_$(echo ${BIL_ULOGFILE}| md5sum | cut -f1 -d" ")_QUEUE
+
+  }
+
+  #_timeout() { ( set +b; sleep "$1" & "${@:2}" & wait -n; kill -9 `jobs -p`; ) }
+
+  [[ "${BIL_PRTLEVEL}"  == "none" ]] && con_msg() { :; }
+  [[ "${BIL_LOGLEVEL}"  == "none" ]] && log_msg() { :; }
+  [[ "${BIL_ULOGLEVEL}" == "none" ]] && ulog_msg() { :; }
+
+  { if [ -n "${message}" ]; then
+        # We have command line arguments.
+        # Output them with newlines in-between if ${BIL_MSG_NEWLINE} = ${BIL_TRUE}
+        [ ${BIL_MSG_NEWLINE} -eq ${BIL_TRUE} ] && printf '%s\n' "${message}" || printf '%s' "${message}"
+    elif [[ ! -t 0 ]]; then
+        # Pass stdin on.
+        echo ">>> BEGIN OF MULTILINE MESSAGE"
+        timeout 0.1 cat
+        echo "<<< END OF MULTILINE MESSAGE"
+    fi
+  } >"${BIL_MSG_BUFFER}"
+
+  case $(wc -l <${BIL_MSG_BUFFER} 2>/dev/null) in
+    2) grep ">>> BEGIN OF MULTILINE MESSAGE" ${BIL_MSG_BUFFER} >/dev/null && :> ${BIL_MSG_BUFFER} || :;;
+    3) grep ">>> BEGIN OF MULTILINE MESSAGE" ${BIL_MSG_BUFFER} >/dev/null && sed -i '2q;d' ${BIL_MSG_BUFFER} 2>/dev/null || :;;
+  esac
+
+  [ -s "${BIL_MSG_BUFFER}" ] && con_msg  "${timestamp}" "${severity}" <"${BIL_MSG_BUFFER}"
+  [ -s "${BIL_MSG_BUFFER}" ] && log_msg  "${timestamp}" "${severity}" <"${BIL_MSG_BUFFER}"
+  [ -s "${BIL_MSG_BUFFER}" ] && ulog_msg "${timestamp}" "${severity}" <"${BIL_MSG_BUFFER}"
+} ## BIL:msg() - END
+
+## ------------------------------------------------------------------------------
+## function: BIL:UserIs
+##
+## description: validate userid
+##
+## usage: BIL:UserIs <userid>
+##
+## where: <username> - username (e.g. oracle)
+##
+## returns: 0 - the runtime user is this username
+##          1 - the runtime user is NOT this username
+##          2 - the user does not exist on this machine
+##          3 - missing parameter
+##
+
+function BIL:UserIs {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local MYUSERID=""
+  local  MYUID=""
+
+  if [ $# -ne 1 ]; then
+    RC=3
+    BIL:msg err "MISSING PARAMETER \"<username>\" in FUNCTION \"BIL:UserIs\""
+  else
+    MYUSERID=$(id -u $1)
+
+    if [ X"$MYUSERID" != X"" ]; then
+      MYUID="$(id -u)"
+
+      if [[ "${MYUID}" == "${MYUSERID}" ]]; then
+        RC=0
+        BIL:msg debug "REQUIRED RUNTIME USER is \"$1\""
+      else
+        RC=1
+        BIL:msg err   "REQUIRED RUNTIME USER is NOT \"$1\""
+      fi
+    else
+      RC=2
+      BIL:msg err   "REQUIRED RUNTIME USER \"$1\" does NOT EXIST on this MACHINE"
+    fi
+  fi
+
+  return ${RC}
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:version
+##
+## description: print version information
+##
+## usage: BIL:version
+##
+
+function BIL:version {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  BIL:cout "${BIL_VERSION_COLOR}" "This is ${BIL_APPL_NAME}${BIL_APPL_VERSION:+ v$BIL_APPL_VERSION}${BIL_APPL_NAME:+ - using }BRASIL v${BIL_VERSION} #${BIL_BASE_ID}\n"
+  [ -n "$BIL_APPL_AUTHOR"    ] && BIL:cout "${BIL_VERSION_COLOR}" "${BIL_APPL_AUTHOR}\n"
+  [ -n "$BIL_APPL_COPYRIGHT" ] && BIL:cout "${BIL_VERSION_COLOR}" "${BIL_APPL_COPYRIGHT}\n"
+  :
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:help
+##
+## description: print help
+##
+## usage: BIL:help
+##
+
+function BIL:help {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  [ -n "${BIL_APPL_HELP}" ] && cat <<EOF
+$BIL_APPL_HELP
+EOF
+
+  cat <<EOF
+$BIL_BASE_HELP_OPTIONS
+EOF
+
+  [ -n "${BIL_APPL_HELP_OPTIONS}" ] && cat <<EOF
+$BIL_APPL_HELP_OPTIONS
+EOF
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:catIniSection
+##
+## description: print the section of a ini file to stdout,
+##              if the section name is not given the implied section is taken
+##
+## usage: BIL:catIniSection [<section>] <inifile>
+##
+
+function BIL:catIniSection() {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local section=""
+  local file=""
+
+  case "$#" in
+    "1") file=$1
+         if grep "^\[[[:alnum:]-]*\]" $file >/dev/null 2>&1; then
+           sed -e 's/[[:space:]]*=[[:space:]]*/=/g' \
+               -e 's/[[:space:]-]*$//' $file | sed -n -e "1,/^\[[[:alnum:]-]*\]/p"| sed '$d'
+         else
+           sed -e 's/[[:space:]]*=[[:space:]]*/=/g' \
+               -e 's/[[:space:]]*$//' $file | sed -n -e "1,/^\[[[:alnum:]-]*\]/p"
+         fi;;
+    "2") section=$1
+         file=$2
+         sed -e 's/[[:space:]]*=[[:space:]]*/=/g' \
+             -e 's/[[:space:]]*$//' $file | sed -n -e "/^\[$section\]/,/^\[[[:alnum:]-]*\]/p" | sed -e '/^\[[[:alnum:]-]*\]/d';;
+    "*") BIL:msg error "BIL:catIniSection: WRONG NUMBER of PARAMETERS SPECIFIED!";;
+  esac
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:include
+##
+## description: source implied or specific section of given file
+##
+## usage: BIL:include  [<section>] <inifile>
+##
+
+function BIL:include() {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local section=""
+  local file=""
+
+  case "$#" in
+    "1") file=$1
+         [ -f "${file}" ] || BIL:die 8 "INCLUDE FILE \"${file}\" NOT FOUND!"
+         ;;
+    "2") section=$1
+         file=$2
+         [ -f "${file}" ] || BIL:die 8 "INCLUDE FILE \"${file}\" NOT FOUND!"
+         BIL:hasIniSection ${section} ${file} || BIL:die 8 "INIFILE SECTION \"${section}\" NOT FOUND - FILE=${file}!"
+         ;;
+    "*") BIL:die 8 "BIL:include: WRONG NUMBER of PARAMETERS SPECIFIED!"
+         ;;
+  esac
+
+  set -a
+  source <(BIL:catIniSection ${section} ${file}) || BIL:die 8 "BIL:include: SOURCING FILE FAILED - SECTION=${section}, FILE=${file}"
+  set +a
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:listIniSections
+##
+## description: lists the names of every ini file section
+##
+## usage: BIL:listIniSections <inifile>
+##
+## output: print inifile section names to sdtout
+##
+
+function BIL:listIniSections() {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  sed -n 's/^[ \t]*\[\(.*\)\].*/\1/p' $1 2>/dev/null || :
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:hasIniSection
+##
+## description: tests if a given ini file section is present
+##
+## usage: BIL:hasIniSection <section> <inifile>
+##
+## returns: 0 - section found
+##          1 - section not found
+##
+
+BIL:hasIniSection() {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  [ $# -eq 2 ] || return 1
+
+  grep -q "^$1" <(BIL:listIniSections $2 2>/dev/null)
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:parseParms
+##
+## description: evaluate some basic SIL options
+##
+## usage: BIL:parseParms
+##
+
+function BIL:parseParms {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local PARM
+  local notproc=""
+  local count
+  local myMessage
+  local ARGS
+  local args
+  local i
+  local simulate=${BIL_FALSE}
+  local colors
+
+  colors=$(tput colors 2>/dev/null)
+  colors=${colors:-0}
+
+  [ ${colors} -ge 8 ] && BIL_COLOR_TERM=${BIL_TRUE} || BIL_COLOR_TERM=${BIL_FALSE}
+
+  if [ "${BIL_COLOR_TERM}" = "${BIL_TRUE}" ]; then
+    BIL_COLOR_STDOUT=${BIL_USE_COLORS}
+    BIL_COLOR_STDERR=${BIL_USE_COLORS}
+  else
+    BIL_COLOR_STDOUT=${BIL_FALSE}
+    BIL_COLOR_STDERR=${BIL_FALSE}
+    BIL_COL_RESET=''
+  fi
+
+  set -- "$@"
+
+  PARM=$(BIL_PRTLEVEL=error; getopt --options "v${BIL_APPL_OPTIONS}" --longoptions "simulate time: help version quiet dump-vars dump-functions ${BIL_APPL_LOPTIONS}" -n "BIL:parseParms" -- "$@"  2>/dev/null)
+
+  if [ $? != 0 ]; then
+    BIL_PRTLEVEL=error
+    BIL_VERBOSE=${BIL_TRUE}
+    BIL:msg error "PARSING parameters FAILED - PARMS=\"$@\""
+    BIL_PRTLEVEL=none
+    BIL_LOGLEVEL=none
+    BIL:die 8
+  fi
+
+  # Note the quotes around `$PARM': they are essential!
+  eval set -- "$PARM"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --simulate) simulate=${BIL_TRUE};;
+      -v) if [ "$simulate" = "${BIL_FALSE}" ]; then
+            count=$(( ${BIL_MSG_SEVERITY[${BIL_PRTLEVEL:-none}]} + 1 ))
+            [ $count -gt 6 ] && count=6
+            #set +o nounset
+            BIL_PRTLEVEL=$(for k in ${!BIL_MSG_SEVERITY[@]}; do if [ "${BIL_MSG_SEVERITY[$k]}" = "$count" ]; then echo $k; break; fi; done)
+            #set -o nounset
+            BIL_VERBOSE=${BIL_TRUE}
+            BIL_QUIET=${BIL_FALSE}
+          fi
+          ;;
+      --version)
+          if [ "$simulate" = "${BIL_FALSE}" ]; then
+            BIL:version
+            BIL_VERBOSE=${BIL_FALSE}
+            BIL_LOGLEVEL=none
+            BIL:die 0
+          fi
+          ;;
+      --dump-vars)
+        if [ "$simulate" = "${BIL_FALSE}" ]; then
+          BIL_PRTLEVEL=none
+          BIL_LOGLEVEL=none
+          BIL_ULOGLEVEL=none
+          BIL:dumpVars
+          BIL:die 0
+        fi
+        ;;
+      --dump-functions)
+        if [ "$simulate" = "${BIL_FALSE}" ]; then
+          BIL_PRTLEVEL=none
+          BIL_LOGLEVEL=none
+          BIL_ULOGLEVEL=none
+          BIL:dumpFunctions
+          BIL:die 0
+        fi
+        ;;
+      --time)
+        shift;
+        BIL_TIME=$1
+        ;;
+      --help)
+        if [ "$simulate" = "${BIL_FALSE}" ]; then
+          BIL:help
+          BIL_PRTLEVEL=none
+          BIL:die 0
+        fi
+        ;;
+      --quiet)
+        BIL_VERBOSE=${BIL_FALSE}
+        BIL_QUIET=${BIL_TRUE}
+        BIL_PRTLEVEL="none"
+        ;;
+      --) shift; break ;;
+      --*) if echo ${BIL_APPL_LOPTIONS}|grep  "${1#--}:" >/dev/null; then
+            notproc=${notproc}"$1 $2 "; shift
+          else
+            notproc=${notproc}"$1 "
+          fi
+          ;;
+      -*) if echo ${BIL_APPL_OPTIONS}|grep  "${1[2]}:" >/dev/null; then
+            notproc=${notproc}"$1 $2 "; shift
+          else
+            notproc=${notproc}"$1 "
+          fi
+          ;;
+      *) BIL:msg error "Internal :$1";;
+    esac
+    shift
+  done
+
+  ## protect whitespaces
+  ## -------------------
+  BIL_APPL_ARGS=""
+  for i in "${notproc}$@"; do
+    if [[ $i =~ [[:space:]] ]]; then
+#      BIL_APPL_ARGS+=$(printf "\"%q\" " "$i")
+      BIL_APPL_ARGS+=$(printf "%q " "$i")
+    else
+      BIL_APPL_ARGS+=$(printf "%q " "$i")
+    fi
+  done
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:execFunction
+##
+## description: execute a function and give it it's own name
+##
+## usage: BIL:execFunction <newName> <functionName> <parms>
+##
+
+function BIL:execFunction {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local newName
+  local funcName
+  local parms
+  case $# in
+  0) BIL:die 8 "BIL:execFunction: EXPECTED PARAMETERS \"<newName> <funcName>\" NOT PASSED!"
+     ;;
+  1) BIL:die 8 "BIL:execFunction: EXPECTED PARAMETER \"<funcName>\" NOT PASSED!"
+     ;;
+  2) newName="$1"
+     funcName="$2"
+     ;;
+  *) newName="$1"
+     funcName="$2"
+     shift; shift
+     parms=" $@"
+     ;;
+  esac
+
+  if typeset -f ${funcName} >/dev/null; then
+    exec -a "${newName}${parms}" /bin/bash <(typeset -f; BIL:dumpVars;  echo ${funcName} "${parms}")
+  else
+    BIL:die "BIL:execFunction: FUNCTION \"${funcName}\" NOT DEFINED!"
+  fi
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:heartbeat
+##
+## description: regularly write the actual time to the ${BIL_LIFELOG} logfile
+##
+## usage: BIL:heartbeat
+##
+
+function BIL:heartbeat {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  BIL:lockFile ${BIL_LIFELOG}
+
+    grep -q "^${BIL_PROCID}" ${BIL_LIFELOG} 2>/dev/null || echo "${BIL_PROCID} $(date +%s)" >> ${BIL_LIFELOG}
+
+  BIL:unlockFile ${BIL_LIFELOG}
+
+  while true; do
+
+    if [ ! -d /proc/${BIL_PROCID} ]; then
+      ( BIL:die 8 "${BIL_APPL_NAME} ENDED ABNORMALY - CLEANING UP NOW..."; sleep ${BIL_LIFELOG_DEATHTIME} ) &
+      wait $!
+      break
+    fi
+
+    if BIL_APPL_LOCK_MAXWAIT=${BIL_LIFELOG_DEATHTIME} BIL:lockFile ${BIL_LIFELOG}; then
+
+      if grep -q "^${BIL_PROCID}" ${BIL_LIFELOG} 2>/dev/null; then
+          sed -i 's/^'"${BIL_PROCID}"' .*/'"${BIL_PROCID} $(date +%s)"'/' ${BIL_LIFELOG} 2>/dev/null
+      else
+        break
+      fi
+
+      BIL:unlockFile ${BIL_LIFELOG}
+    else
+      if [ -d /proc/${BIL_PROCID} ]; then
+        BIL:msg error "HEARTBEAT TIMEOUT (${BIL_LIFELOG_DEATHTIME}s) ACQUIRING LIFELOG - TERMINATING \"${BIL_PROCID}\" PROCESS GENTLY NOW!"
+        BIL:msg error "ACTUAL $(_BIL:cpuLoad)% CPU LOAD"
+        kill -15 ${BIL_PROCID} 2>/dev/null
+
+        ( sleep ${BIL_LIFELOG_DEATHTIME}
+
+          if [ -d /proc/${BIL_PROCID} ]; then
+            BIL:msg error "PROCESS CLEAN EXIT of \"${BIL_PROCID}\" FAILED - KILLING UNCONDITIONALY NOW!"
+            kill -9 ${BIL_PROCID} 2>/dev/null
+          fi
+        )&
+
+      fi
+
+      break
+    fi
+
+    ( sleep ${BIL_LIFELOG_INTERVAL} ) &
+    wait $!
+
+  done
+
+  BIL:unlockFile ${BIL_LIFELOG}
+
+  exit 0
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:init
+##
+## description: initial variable setup
+##
+## usage: BIL:init
+##
+
+function BIL:init {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local rc
+
+  BIL:include brasil-runtime-parms ${BASH_SOURCE}
+  BIL:include brasil-static-parms ${BASH_SOURCE}
+
+  BIL:lockTrap
+
+  [ $# -gt 0 ] && shift
+
+
+  [ "${BIL_APPL_CONFIG}" = "${BIL_DEFAULT_CONFIG}" ] && BIL_APPL_CONFIG=""
+
+  ## Read default config file
+  ## ------------------------
+  if [ -s "${BIL_DEFAULT_CONFIG}" ]; then
+    BIL:include ${BIL_DEFAULT_CONFIG}
+  fi
+
+  ## Read appl config file
+  ## ---------------------
+  if [ -s "${BIL_APPL_CONFIG}" ]; then
+    BIL:include ${BIL_APPL_CONFIG}
+  fi
+
+  [ -z "${BIL_APPL_NAME}" ] && BIL_APPL_NAME="${BIL_APPL_CMD}"
+
+  [[ -n "${BIL_LOGFILE}"  && ! -a "${BIL_LOGFILE}"  ]] && :> ${BIL_LOGFILE}
+  [[ -n "${BIL_ULOGFILE}" && ! -a "${BIL_ULOGFILE}" ]] && :> ${BIL_ULOGFILE}
+
+  BIL:parseParms "$@"
+
+  ( BIL:execFunction heartbeat-${BIL_APPL_NAME}-${BIL_PROCID} BIL:heartbeat ) &
+  BIL_HEARTBEAT_PID=$!
+
+
+  if [ -s "${BIL_APPL_CONFIG}" ]; then
+    BIL:msg debug "USING \"${BIL_APPL_CONFIG}\" APPL CONFIG"
+  fi
+
+  ## Display some important vars
+  ## ---------------------------
+  BIL:msg debug3 "$(BIL:dumpVars BIL_)"
+
+  BIL_EXIT_ROUTINES="BIL:done"
+
+  ## Checking required runtime user
+  ## ------------------------------
+
+  if [ -n "${BIL_REQUIRED_USER}" ]; then
+
+    if BIL:UserIs "${BIL_REQUIRED_USER}"; then
+      loglevel=${BIL_LOGLEVEL}
+      uloglevel=${BIL_ULOGLEVEL}
+      BIL_LOGLEVEL=none
+      BIL_ULOGLEVEL=none
+
+      if [ -n "${BIL_LOGFILE}" ] ; then
+        [ ! -e "${BIL_LOGFILE}" ] && : > ${BIL_LOGFILE}
+        chmod 660 ${BIL_LOGFILE}
+        BIL_LOGLEVEL=${loglevel}
+        BIL_ULOGLEVEL=${uloglevel}
+      fi
+    else
+      BIL:die 16 "EXECUTION of this function is FORBIDDEN!"
+    fi
+  fi
+
+  [ "${BIL_NO_TEMPDIR_DELETE}"x = "${BIL_TRUE}"x ] || { mkdir $(dirname ${BIL_TMPPREFIX}) 2>/dev/null || true; }
+
+  ## create temp files
+  ## -----------------
+  local i
+  for (( i=1; i<=${BIL_NUM_OF_TMPFILES}; i++)); do
+      BIL:createTemp --file TMPFILE${i} && eval BIL_TMPFILE${i}="${BIL_TMPPREFIX}#${BIL_PROCID}_TMPFILE${i}"
+  done
+
+  BIL:msg debug2 "heartbeat-${BIL_APPL_NAME}-${BIL_PROCID} STARTED - PID=${BIL_HEARTBEAT_PID}"
+
+  if [ -s "${BIL_DEFAULT_CONFIG}" ]; then
+    BIL:msg debug "USING \"${BIL_DEFAULT_CONFIG}\" DEFAULT CONFIG"
+  fi
+
+  BIL:msg info "WAITING for \"${BIL_APPL_NAME}\" QUEUE - MODE=${BIL_RUNTYPE^^}${BIL_PARALLEL:+; COUNT=$BIL_PARALLEL}"
+
+  if BIL:waitforQueue --${BIL_RUNTYPE,,} ${BIL_APPL_NAME}; then
+
+    BIL:msg info "OBTAINING \"${BIL_APPL_NAME}\" ${BIL_RUNTYPE^^} QUEUE SUCCESSFULL"
+  else
+    BIL:die 8 "OBTAINING \"${BIL_APPL_NAME}\" ${BIL_RUNTYPE^^} QUEUE FAILED!"
+  fi
+
+  BIL:msg debug "BRASIL v${BIL_VERSION} INITIALIZED" && BIL_INITIALIZED="${BIL_TRUE}"
+
+  BIL:unlockTrap
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:run
+##
+## description: run brasil application
+##
+## usage: BIL:run
+##
+
+function BIL:run {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  local cmd="$1"
+  local parm="$2"
+  local sleepTime
+  local cpu
+
+  cpu=$(_BIL:cpuLoad)
+  while [ $(($(echo ${cpu}|cut -d"." -f1)*100+$(( 10#$(echo ${cpu}|cut -d"." -f2) )) )) -gt $((${BIL_MAX_CPU_PCT}*100)) ]; do
+    # sleep randomly between 5 and 10.99 seconds to take cpu load into consideration
+    sleepTime=$(_BIL:random 5 10).$(_BIL:random 1 99)
+    BIL:msg debug2 "${cpu}% CPU LOAD - SLEEPING ${sleepTime}s"
+    sleep ${sleepTime}
+    cpu=$(_BIL:cpuLoad)
+  done
+
+  BIL:msg notice "${BIL_APPL_CMD} ${BIL_APPL_VERSION:+v${BIL_APPL_VERSION}} STARTED - HOSTNAME=${BIL_HOST}, OS=${BIL_OS}, APPLID=${BIL_APPL_ID}, CPU=${cpu}%"
+
+  if [ -n "${BIL_TIME}" ];then
+    BIL:msg notice "SETTING ${BIL_TIME}s MAXIMUM EXECUTION TIME"
+    ( sleep ${BIL_TIME}; (set +o errexit; kill -sigalrm ${BIL_PROCID}) )&
+  fi
+
+  BIL:msg debug  "USER \"${BIL_USERNAME}\" is ASSIGNED TO THIS PROCESS"
+  BIL:msg debug  "GROUP \"${BIL_GROUPNAME}\" is ASSIGNED TO THIS PROCESS"
+  BIL:msg debug3 "LD_LIBRARY_PATH is \"${LD_LIBRARY_PATH}\""
+  BIL:msg debug3 "PATH is \"${PATH}\""
+  BIL:msg debug3 "BASH VERSION is \"${BASH_VERSION}\""
+  BIL:msg debug3 "CURRENT DIRECTORY is \"${PWD}\""
+
+  BIL:msg info 'EXECUTING "'$(echo "$cmd $parm"|sed -e 's/[ ]*$//')'" COMMAND'
+  . "$cmd" "$parm"
+
+}
+
+## ------------------------------------------------------------------------------
+## function: BIL:done
+##
+## description: end brasil application
+##
+## usage: BIL:done
+##
+
+function BIL:done {
+  set +x;${BIL_FUNCTION_HEADER}
+
+  BIL:die 0
+
+}
+
+BIL_INCLUDE_SCRIPT_RUNNING=""
+
+##-------------------------------------------------------------------------------
+## Main
+##-------------------------------------------------------------------------------
+
+exec 8>&1
+exec 9>&2
+
+BIL:init "$@"
+BIL:run "${BIL_APPL_BINDIR}/${BIL_APPL_CMD}" "${BIL_APPL_ARGS}"
+BIL:done
+
+##-------------------------------------------------------------------------------
+## BRASIL static and runtime parameter sections
+##-------------------------------------------------------------------------------
+
+[brasil-static-parms]
+  BIL_TRUE=0
+  BIL_FALSE=1
+  BIL_VERSION=1.22.3
+  BIL_APPL_LOCK_MAXWAIT=${BIL_APPL_MAXWAIT:-7200}  # Default is 2h = 7200s
+  BIL_APPL_QUEUE_MAXWAIT=${BIL_APPL_MAXWAIT:-7200} # Default is 2h = 7200s
+  BIL_APATH=${BIL_APATH:-}
+  BIL_COL_NONE=''
+  BIL_COL_RESET='\e[0m\e[K'
+  BIL_COL_BOLD='\e[1m'
+  BIL_COL_UNDERLINE='\e[4m'
+  BIL_COL_BLINK='\e[5m'
+  BIL_COL_REVERSE='\e[7m'
+  BIL_COL_HIDDEN='\e[8m'
+  BIL_COL_DEBUG='\e[0;37m\e[41m'
+  BIL_COL_BLACK='\e[30m'
+  BIL_COL_RED='\e[31m'
+  BIL_COL_GREEN='\e[32m'
+  BIL_COL_YELLOW='\e[33m'
+  BIL_COL_BLUE='\e[34m'
+  BIL_COL_MAGENTA='\e[35m'
+  BIL_COL_CYAN='\e[36m'
+  BIL_COL_LGRAY='\e[37m'
+  BIL_COL_DGREY='\e[90m'
+  BIL_COL_LRED='\e[91m'
+  BIL_COL_LGREEN='\e[92m'
+  BIL_COL_LYELLOW='\e[93m'
+  BIL_COL_LBLUE='\e[94m'
+  BIL_COL_LMAGENTA='\e[95m'
+  BIL_COL_LCYAN='\e[96m'
+  BIL_COL_LBLACK='\e[1;30m'
+  BIL_COL_WHITE='\e[97m'
+  BIL_COL_LWHITE='\e[1;97m'
+  BIL_COL_BGBLACK='\e[40m'
+  BIL_COL_BGRED='\e[41m'
+  BIL_COL_BGGREEN='\e[42m'
+  BIL_COL_BGYELLOW='\e[43m'
+  BIL_COL_BGBLUE='\e[44m'
+  BIL_COL_BGMAGENTA='\e[45m'
+  BIL_COL_BGCYAN='\e[46m'
+  BIL_COL_BGLGREY='\e[47m'
+  BIL_COL_BGDGREY='\e[100m'
+  BIL_COL_BGLRED='\e[101m'
+  BIL_COL_BGLGREEN='\e[102m'
+  BIL_COL_BGLYELLOW='\e[103m'
+  BIL_COL_BGLBLUE='\e[104m'
+  BIL_COL_BGLMAGENTA='\e[105m'
+  BIL_COL_BGLCYAN='\e[106m'
+  BIL_COL_BGWHITE='\e[107m'
+  BIL_APPL_NAME="${BIL_APPL_NAME:-}"
+  BIL_PARALLEL=${BIL_PARALLEL:-}
+  BIL_APPL_AUTHOR=""
+  BIL_APPL_COPYRIGHT=""
+  BIL_APPL_OPTIONS="${BIL_APPL_OPTIONS:-}"
+  BIL_APPL_LOPTIONS="${BIL_APPL_LOPTIONS:-}"
+  BIL_APPL_HELP=""
+  BIL_APPL_HELP_OPTIONS=""
+  BIL_FUNCTION_HEADER="${BIL_FUNCTION_HEADER:-}"
+  BIL_HEARTBEAT_PID=""
+  BIL_MAX_CPU_PCT=${BIL_MAX_CPU_PCT:-90}
+  BIL_PROCNAME=""
+  BIL_EXIT_ROUTINES=${BIL_EXIT_ROUTINES:-}
+  BIL_SAVE_LANG="$LANG"
+  BIL_TRAP_SIGNAL=""
+  BIL_TRAP_LINENO=""
+  BIL_HIGHLIGHT_ERROR_NUMBERS=5
+  BIL_TRAP_FUNCTION=""
+  BIL_TRAP_LOCKED=""
+  BIL_EXIT_VIA_DIE=${BIL_FALSE}
+  BIL_NUM_OF_TMPFILES=${BIL_NUM_OF_TMPFILES:-2}
+  BIL_TMPFILE_UMASK=${BIL_TMPFILE_UMASK:-177}
+  BIL_TMPDIR_UMASK=${BIL_TMPDIR_UMASK:-077}
+  BIL_MAXCC=0
+  BIL_SEVERITY=""
+  BIL_VERBOSE=${BIL_VERBOSE:-$BIL_TRUE}
+  BIL_QUIET=${BIL_QUIET:-BIL_FALSE}
+  BIL_REQUIRED_USER=${BIL_REQUIRED_USER:-}
+  BIL_PRTLEVEL=${BIL_PRTLEVEL:-none}
+  BIL_ULOGFILE=${BIL_ULOGFILE:-/dev/null}
+  BIL_ULOGLEVEL=${BIL_ULOGLEVEL:-none}
+  BIL_ULOGFILE_KEEP_DAYS="30"
+  BIL_ULOGFILE_FILTER=""
+  BIL_LOGFILE=${BIL_LOGFILE:-/dev/null}
+  BIL_LOGLEVEL=${BIL_LOGLEVEL:-none}
+  BIL_LOGFILE_KEEP_DAYS="30"
+  BIL_LOGFILE_FILTER=""
+  BIL_MSG_PRTTIMESTAMP=${BIL_MSG_PRTTIMESTAMP:-$BIL_TRUE}
+  BIL_MSG_DATETIME_FORMAT=${BIL_MSG_DATETIME_FORMAT:-"+%Y-%m-%d %H:%M:%S.%3N"}
+  BIL_MSG_NEWLINE=${BIL_TRUE}
+  # BIL_MSG_FORMAT='\["${message_prefix}"\] ${timestamp} \[${BIL_APPL_NAME}\|${callingFunction}:${BIL_PROCID}\]:" "'
+  BIL_MSG_FORMAT='\["${message_prefix}"\] ${timestamp} \[${BIL_APPL_NAME}:${BIL_PROCID}\]:" "'
+  BIL_USE_COLORS=${BIL_USE_COLORS:-${BIL_TRUE}}
+  BIL_COLOR_TERM=${BIL_COLOR_TERM:-${BIL_FALSE}}
+  BIL_COLOR_STDOUT=${BIL_COLOR_STDOUT:-${BIL_FALSE}}
+  BIL_COLOR_STDERR=${BIL_COLOR_STDERR:-${BIL_FALSE}}
+  BIL_NO_TEMPFILES_DELETE=${BIL_NO_TEMPFILES_DELETE:-$BIL_FALSE}
+  BIL_NO_TEMPDIR_DELETE=${BIL_NO_TEMPDIR_DELETE:-$BIL_FALSE}
+  BIL_NO_CLEANUP=${BIL_NO_CLEANUP:-$BIL_FALSE}
+  BIL_CLEANUP_ON_ERROR=${BIL_CLEANUP_ON_ERROR:-$BIL_TRUE}
+  BIL_STTY_SETTINGS=""
+  BIL_TIME=${BIL_TIME:-}
+  BIL_USER_BREAK_ALLOWED=${BIL_USER_BREAK_ALLOWED:-$BIL_TRUE}
+  BIL_PROCESS_HEALTH_TIMEOUT=${BIL_PROCESS_HEALTH_TIMEOUT:-5}
+  BIL_SIGNAL_HANDLER_RUNNING=${BIL_FALSE}
+  BIL_SIGNAL_HANDLE_SIGHUP=${BIL_SIGNAL_HANDLE_SIGHUP:-${BIL_FALSE}}
+  BIL_SIGNAL_HANDLE_SIGINT=${BIL_SIGNAL_HANDLE_SIGINT:-${BIL_TRUE}}
+  BIL_SIGNAL_HANDLE_SIGQUIT=${BIL_SIGNAL_HANDLE_SIGQUIT:-${BIL_TRUE}}
+  BIL_SIGNAL_HANDLE_SIGEXIT=${BIL_SIGNAL_HANDLE_SIGEXIT:-${BIL_TRUE}}
+  BIL_SIGNAL_HANDLE_SIGTERM=${BIL_SIGNAL_HANDLE_SIGTERM:-${BIL_TRUE}}
+  BIL_SIGNAL_HANDLE_SIGUSR1=${BIL_SIGNAL_HANDLE_SIGUSR1:-${BIL_FALSE}}
+  BIL_SIGNAL_HANDLE_SIGUSR2=${BIL_SIGNAL_HANDLE_SIGUSR2:-${BIL_FALSE}}
+  BIL_SIGNAL_HANDLE_SIGALRM=${BIL_SIGNAL_HANDLE_SIGALRM:-${BIL_TRUE}}
+  BIL_SIGNAL_HANDLE_SIGERR=${BIL_SIGNAL_HANDLE_SIGERR:-${BIL_FALSE}}
+  BIL_SIGNAL_SIGHUP_FUNCTION=""
+  BIL_SIGNAL_SIGINT_FUNCTION=""
+  BIL_SIGNAL_SIGQUIT_FUNCTION=""
+  BIL_SIGNAL_SIGEXIT_FUNCTION=""
+  BIL_SIGNAL_SIGTERM_FUNCTION=""
+  BIL_SIGNAL_SIGUSR1_FUNCTION=""
+  BIL_SIGNAL_SIGUSR2_FUNCTION=""
+  BIL_SIGNAL_SIGALRM_FUNCTION=""
+  BIL_SIGNAL_SIGERR_FUNCTION=""
+  BIL_RUNTYPE=${BIL_RUNTYPE:-PARALLEL}
+  BIL_TMPDIR=${BIL_TMPDIR:-$TMPDIR}
+  BIL_TMPPREFIX=${BIL_TMPDIR}/BIL_${BIL_APPL_ID}_
+  BIL_VERSION_COLOR="LBLUE+BOLD"
+  BIL_MSG_BUFFER="${BIL_TMPPREFIX}#${BIL_PROCID}_MSG_BUFFER"
+  BIL_LIFELOG="${BIL_TMPPREFIX}LIFELOG"
+  BIL_LIFELOG_INTERVAL=5
+  BIL_LIFELOG_DEATHTIME=300
+  BIL_DEBUG=${BIL_DEBUG:-1}
+  LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+  BIL_BASE_HELP_OPTIONS="
+$(echo -e $BIL_COL_BOLD)OPTIONS:$(echo -e $BIL_COL_RESET)
+        --help
+               display this help and exit
+        --time <maxExecutionTime>
+               set maximum execution time in seconds
+        -v
+               Verbose mode.  Causes ${BIL_APPL_NAME:-script} to print debugging messages about its progress
+               Multiple -v options increase the verbosity
+        --version
+               display version information and exit
+        --quiet
+               Quiet mode.  Causes most warning and diagnostic messages to be suppressed
+        --dump-vars
+               display brasil global variables
+        --dump-functions
+               display brasil global functions"
+
+  ## arrays
+  ## ------
+  BIL_LIST_OF_LOCKFILES=()
+  BIL_LIST_OF_LOCKQUEUES=()
+  BIL_HIGHLIGHT_ERROR_COLOR=(BLACK+BOLD BLACK+BOLD RED+BOLD)
+
+[brasil-runtime-parms]
+  ## calculate TMPDIR
+  ## ----------------
+  for TMPDIR in "${TMPDIR:-}" "${TMP:-}" /var/tmp /tmp; do
+    test -d "$TMPDIR" && break
+  done
+
+  _SEP_=$(echo '\001')
+  BIL_PROCID=$$
+  BIL_BASE_ID="$(sha256sum $0 2>/dev/null| cut -d' ' -f1)"
+  BIL_BASE_ID=${BIL_BASE_ID:30:10}
+  BIL_BASE_LIBDIR=$(dirname ${BASH_SOURCE})
+  BIL_BASE_BINDIR="$(cd $(dirname $(readlink -f $0))/ && pwd)"
+  BIL_APPL_CORE_CMD=$(basename $(readlink -f $0))
+  BIL_APPL_CMD=$(basename $0)
+  BIL_APPL_BINDIR="$(cd $(dirname $0)/ && pwd)"
+  BIL_APPL_ID=$(echo ${BIL_APPL_BINDIR}/${BIL_APPL_CMD} | sha256sum | cut -d" " -f1)
+  BIL_APPL_ID=${BIL_APPL_ID:30:10}
+  BIL_APPL_LOGDIR="$(cd ${BIL_APPL_BINDIR}/../log/ 2>/dev/null && pwd 2>/dev/null)"
+  BIL_APPL_LOGDIR="${BIL_APPL_LOGDIR:-$(cd ${BIL_APPL_BINDIR}/../logs/ 2>/dev/null && pwd 2>/dev/null)}"
+  BIL_APPL_LOGDIR=${BIL_APPL_LOGDIR:-${BIL_APPL_BINDIR}}
+  BIL_APPL_CONFIG=${BIL_APPL_CONFIG:-$(grep -lR --include "${BIL_APPL_CMD%.*}.cfg" --include "${BIL_APPL_CMD%.*}.conf" --include "${BIL_APPL_CMD%.*}.config" --exclude "${BIL_APPL_CMD}" '.*' $(cd ${BIL_BASE_BINDIR}; pwd) 2>/dev/null|head -1)}
+  BIL_APPL_CONFIG=${BIL_APPL_CONFIG:-$(grep -lR --include "${BIL_APPL_CMD%.*}.cfg" --include "${BIL_APPL_CMD%.*}.conf" --include "${BIL_APPL_CMD%.*}.config" --exclude "${BIL_APPL_CMD}" '.*' $(cd ${BIL_BASE_BINDIR}/..; pwd) 2>/dev/null|head -1)}
+  BIL_DEFAULT_CONFIG=${BIL_DEFAULT_CONFIG:-$(grep -lR --include "${BIL_APPL_CORE_CMD%.*}.cfg" --include "${BIL_APPL_CORE_CMD%.*}.conf" --include "${BIL_APPL_CORE_CMD%.*}.config" --exclude "${BIL_APPL_CORE_CMD}" '.*' $(cd ${BIL_BASE_BINDIR}; pwd) 2>/dev/null|head -1)}
+  BIL_DEFAULT_CONFIG=${BIL_DEFAULT_CONFIG:-$(grep -lR --include "${BIL_APPL_CORE_CMD%.*}.cfg" --include "${BIL_APPL_CORE_CMD%.*}.conf" --include "${BIL_APPL_CORE_CMD%.*}.config" --exclude "${BIL_APPL_CORE_CMD}" '.*' $(cd ${BIL_BASE_BINDIR}/..; pwd) 2>/dev/null|head -1)}
+  BIL_USERNAME=${BIL_USERNAME:-$(id -nu)}                                               # real user name
+  BIL_GROUPNAME=${BIL_GROUPNAME:-$(id -ng)}                                             # real group name
+  #BIL_STTY_SETTINGS="$( stty -g 2>/dev/null)"                                          # saved STTY settings
+  BIL_ORIGINAL_UMASK="$( umask )"
+  BIL_ORIGINAL_DIR=$(pwd)
+  BIL_HOST="$(uname -n|cut -f1 -d'.')"
+  BIL_OS="$(uname -s)"
+  BIL_OS_VERSION="$(uname -r)"
+  BIL_OS_RELEASE="$(uname -v)"
+  BIL_MACHINE_ARC="$(uname -p)"
+  BIL_START_TIMER=$(date "+%s.%N")
+  BIL_ULOGCMD='cat - >> ${BIL_ULOGFILE}'
+  BIL_LOGCMD='cat - >> ${BIL_LOGFILE}'
