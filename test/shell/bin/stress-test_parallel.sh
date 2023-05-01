@@ -1,13 +1,13 @@
 #!/bin/sh
 
-(  ./stress.sh $@)&
+(  ./stress.sh 1)&
 pid1=$!
 
-(  ./stress.sh $@)&
+(  ./stress.sh 2)&
 pid2=$!
 
-for i in {1..78}; do
-  (  ./stress.sh $@)&
+for i in {3..78}; do
+  (  ./stress.sh $i)&
 done
 
 sleep 1
