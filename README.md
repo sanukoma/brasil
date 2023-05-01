@@ -1,2 +1,2 @@
 # brasil
-BRASIL - Bash Refurbish Applications Selecting Imperfect Library
+BRASIL - Bash Refurbished Applications Selecting Imperfect Library
