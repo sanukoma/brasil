@@ -1,14 +1,14 @@
-## +-------------------------------------------------------------------------+
-## | @(#) BRASIL - Bash Refurbished Applications Selecting Imperfect Library |
-## +-------------------------------------------------------------------------+
+## +-----------------------------------------------------------------------+
+## | @(#) BRASIL - Build Reliable Applications Selecting Imperfect Library |
+## +-----------------------------------------------------------------------+
 ##
 ## NAME
 ##   brasil
 ##
 ## DESCRIPTION
-##   This file includes the core public functions of the brasil shell scripting library.
+##   This is the brasil bash shell scripting library including some core public functions.
 ##   It helps to solve some every day shell scripting problems by implementing functions 
-##   for simple logging, signal handling, file locking, concurrency and load control,
+##   for simple logging, signal handling, file locking, concurrency, load control,
 ##   debugging capabilities, limiting maximum execution time, etc.
 ##
 ## AUTHOR
@@ -58,7 +58,7 @@ command -v grep >/dev/null      || { echo "ERROR: MANDATORY COMMAND \"grep\" NOT
 command -v readlink >/dev/null  || { echo "ERROR: MANDATORY COMMAND \"readlink\" NOT FOUND!" >&2; return 8; }
 command -v printf >/dev/null    || { echo "ERROR: MANDATORY COMMAND \"printf\" NOT FOUND!" >&2; return 8; }
 command -v timeout >/dev/null   || { echo "ERROR: MANDATORY COMMAND \"timeout\" NOT FOUND!" >&2; return 8; }
-command -v shasum >/dev/null    || { echo "ERROR: MANDATORY COMMAND \"shasum\" NOT FOUND!" >&2; return 8; }
+command -v sha256sum >/dev/null || { echo "ERROR: MANDATORY COMMAND \"shasum\" NOT FOUND!" >&2; return 8; }
 command -v md5sum >/dev/null    || { echo "ERROR: MANDATORY COMMAND \"md5sum\" NOT FOUND!" >&2; return 8; }
 command -v find >/dev/null      || { echo "ERROR: MANDATORY COMMAND \"find\" NOT FOUND!" >&2; return 8; }
 
