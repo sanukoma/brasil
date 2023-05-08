@@ -1,5 +1,3 @@
-Sure, I can help you with that. Here's the updated README.md:
-
 # BRASIL - Build Reliable Applications Selecting Imperfect Library
 
 BRASIL is a library for Bash scripts that provides a collection of useful functions, helper scripts, and common patterns to help developers write more reliable and maintainable code.
